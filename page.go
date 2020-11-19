@@ -31,13 +31,13 @@ type Page struct {
 	// size of data
 	Len PageSz // 2
 	// next same typed page num
-	Next     PagePtr // 4
-	ptr      PageSz  // 2+2
-	CheckSum uint32  // 4
+	Next     PageId // 4
+	ptr      PageSz // 2+2
+	CheckSum uint32 // 4
 }
 
 type PageObj struct {
-	Id         PagePtr
+	Id         PageId
 	Header     *Page
 	data       []byte
 	start, end [6]byte

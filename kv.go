@@ -11,7 +11,7 @@ type KVFlag uint8
 // minKVSize = flag + kLen + k + vLen + v = 1 + 1 + 1 + 1 + 1 = 5
 var minKVSize = 5
 
-// maxKVPerPage = 8(header) + n * 5 + n <= 4096  -> n = 681
+// maxKVPerPage = 8(head) + n * 5 + n <= 4096  -> n = 681
 
 const (
 	KVKeyPrefixed KVFlag = 1 << iota

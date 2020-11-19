@@ -7,8 +7,28 @@ import (
 	"unsafe"
 )
 
+var ErrWriteByOther = errors.New("db opened with write mode by another process")
+
 // flock acquires an advisory lock on a file descriptor.
-func flock(db *DB, timeout time.Duration) error {
+func flock(db *DB) error {
+	flag := syscall.LOCK_SH
+	if !db.readOnly {
+		flag = syscall.LOCK_EX
+	}
+
+	// Otherwise attempt to obtain an exclusive lock.
+	err := syscall.Flock(int(db.file.Fd()), flag|syscall.LOCK_NB)
+	if err == nil {
+		return nil
+	} else if err.(syscall.Errno) == syscall.EWOULDBLOCK || err.(syscall.Errno) == syscall.EAGAIN { // linux & unix
+		return ErrWriteByOther
+	} else {
+		return errors.Wrap(err, "flock failed: unknown error")
+	}
+}
+
+// flock acquires an advisory lock on a file descriptor.
+func waitflock(db *DB, timeout time.Duration) error {
 	var t time.Time
 	for {
 		// If we're beyond our timeout then return an error.
@@ -18,19 +38,11 @@ func flock(db *DB, timeout time.Duration) error {
 		} else if timeout > 0 && time.Since(t) > timeout {
 			return errors.New("timeout")
 		}
-		flag := syscall.LOCK_SH
-		if !db.readOnly {
-			flag = syscall.LOCK_EX
-		}
-
 		// Otherwise attempt to obtain an exclusive lock.
-		err := syscall.Flock(int(db.file.Fd()), flag|syscall.LOCK_NB)
-		if err == nil {
-			return nil
-		} else if err != syscall.EWOULDBLOCK {
-			return err
+		err := flock(db)
+		if !errors.Is(err, ErrWriteByOther) {
+			return errors.Wrap(err, "flock failed: unknown error")
 		}
-
 		// Wait for a bit and try again.
 		time.Sleep(50 * time.Millisecond)
 	}

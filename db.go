@@ -3,10 +3,10 @@ package sidb
 import (
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
+	"hash/crc32"
 	"os"
 	"runtime"
 	"sync"
-	"time"
 	"unsafe"
 )
 
@@ -17,6 +17,8 @@ const (
 	IgnoreNoSync        = runtime.GOOS == "openbsd"
 	// maxMapSize represents the largest mmap size supported by Bolt.
 	maxMapSize = 0xFFFFFFFFFFFF // 256TB
+	// The largest step that can be taken when remapping the mmap.
+	maxMmapStep = 1 << 30 // 1GB
 
 	// maxAllocSize is the size used when creating array pointers.
 	maxAllocSize     = 0x7FFFFFFF
@@ -25,11 +27,6 @@ const (
 
 // Options represents the options that can be set when opening a database.
 type Options struct {
-	// Timeout is the amount of time to wait to obtain a file lock.
-	// When set to zero it will wait indefinitely. This option is only
-	// available on Darwin and Linux.
-	Timeout time.Duration
-
 	// Sets the DB.NoGrowSync flag before memory mapping the file.
 	NoGrowSync bool
 
@@ -52,15 +49,16 @@ type Options struct {
 	// it takes no effect.
 	InitialMmapSize int
 
+	Compression CompressAlgorithm
+
 	//PageSize uint32
 }
 
 var DefaultOptions = &Options{
-	Timeout:    0,
 	NoGrowSync: false,
 }
 
-type PagePtr uint32
+type PageId uint32
 type PageSz uint32
 
 const maxPageSize PageSz = 0xFFFF
@@ -81,8 +79,8 @@ type HeadPage struct {
 	Compression CompressAlgorithm // 2
 	PageSize    PageSz            // 4
 
-	PageCount      PagePtr // 4
-	IndexPageCount uint32  // 4
+	PageCount      PageId // 4
+	IndexPageCount uint32 // 4
 
 	// point to the last record
 	indexPtr RecordPtr // 8
@@ -90,9 +88,22 @@ type HeadPage struct {
 	kvPtr RecordPtr // 8
 
 	// point to the next index page
-	nextIndexPage PagePtr // 4
+	nextIndexPage PageId // 4
 	// the start pos of data in page
 	ptr PageSz // 4
+}
+
+func (h *HeadPage) validate(db *DB) error {
+	if h.magic != Magic {
+		return errors.New("wrong magic")
+	}
+	if h.Version != Version {
+		return errors.New("version mismatch")
+	}
+	if h.Checksum != 0 && h.Checksum != crc32.ChecksumIEEE(db.data[h.ptr:h.PageSize]) {
+		return errors.New("checksum mismatch")
+	}
+	return nil
 }
 
 // size: 16
@@ -153,6 +164,7 @@ type DB struct {
 	metalock sync.Mutex   // Protects meta page access.
 	mmaplock sync.RWMutex // Protects mmap access during remapping.
 	statlock sync.RWMutex // Protects stats access.
+	pagePool sync.Pool
 
 	ops struct {
 		writeAt func(b []byte, off int64) (n int, err error)
@@ -162,8 +174,12 @@ type DB struct {
 	// When true, Update() and Begin(true) return ErrDatabaseReadOnly immediately.
 	readOnly bool
 
-	header  *HeadPage
+	head    *HeadPage
 	indexes []*Index
+
+	compression  CompressAlgorithm
+	compressor   Compressor
+	decompressor DeCompressor
 }
 
 func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
@@ -178,6 +194,8 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 
 	// Set default values for later DB operations.
 	db.AllocSize = DefaultAllocSize
+
+	db.compression = options.Compression
 
 	flag := os.O_RDWR
 	if options.ReadOnly {
@@ -206,7 +224,7 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	// if !options.ReadOnly.
 	// The database file is locked using the shared lock (more than one process may
 	// hold a lock at the same time) otherwise (options.ReadOnly is set).
-	if err := flock(db, options.Timeout); err != nil {
+	if err := flock(db); err != nil {
 		_ = db.close()
 		return nil, err
 	}
@@ -214,49 +232,62 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	// Default values for test hooks
 	db.ops.writeAt = db.file.WriteAt
 
-	//// Initialize the database if it doesn't exist.
-	//if info, err := db.file.Stat(); err != nil {
-	//	return nil, err
-	//} else if info.Size() == 0 {
-	//	// Initialize new files with meta pages.
-	//	if err := db.init(); err != nil {
-	//		return nil, err
-	//	}
-	//} else {
-	//	// Read the first meta page to determine the page size.
-	//	var buf [4096]byte
-	//	if _, err := db.file.ReadAt(buf[:], 0); err == nil {
-	//		m := (*HeadPage)(unsafe.Pointer(&buf))
-	//		if err := m.validate(); err != nil {
-	//			// If we can't read the page size, we can assume it's the same
-	//			// as the OS -- since that's how the page size was chosen in the
-	//			// first place.
-	//			//
-	//			// If the first page is invalid and this OS uses a different
-	//			// page size than what the database was created with then we
-	//			// are out of luck and cannot access the database.
-	//			db.pageSize = os.Getpagesize()
-	//		} else {
-	//			db.pageSize = int(m.pageSize)
-	//		}
-	//	}
-	//}
-	//
-	//// Initialize page pool.
-	//db.pagePool = sync.Pool{
-	//	New: func() interface{} {
-	//		return make([]byte, db.pageSize)
-	//	},
-	//}
-	//
-	//// Memory map the data file.
-	//if err := db.mmap(options.InitialMmapSize); err != nil {
-	//	_ = db.close()
-	//	return nil, err
-	//}
+	// Initialize the database if it doesn't exist.
+	if info, err := db.file.Stat(); err != nil {
+		return nil, err
+	} else if info.Size() == 0 {
+		// Initialize new files with meta pages.
+		if err := db.init(); err != nil {
+			return nil, err
+		}
+	} else {
+		// Read the first meta page to determine the page size.
+		var buf [4096]byte
+		if _, err := db.file.ReadAt(buf[:], 0); err == nil {
+			h := (*HeadPage)(unsafe.Pointer(&buf))
+			db.pageSize = int(h.PageSize)
+		}
+	}
+
+	// Initialize page pool.
+	db.pagePool = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, db.pageSize)
+		},
+	}
+
+	// Memory map the data file.
+	if err := db.mmap(options.InitialMmapSize); err != nil {
+		_ = db.close()
+		return nil, err
+	}
+
+	switch db.compression {
+	case CompSnappy:
+		db.compressor = SnappyCompress
+		db.decompressor = SnappyDeCompress
+	case CompLz4:
+		db.compressor = Lz4Compress
+		db.decompressor = Lz4DeCompress
+	}
 
 	// Mark the database as opened and return.
 	return db, nil
+}
+
+// Close releases all database resources.
+// All transactions must be closed before closing the database.
+func (db *DB) Close() error {
+	db.rwlock.Lock()
+	defer db.rwlock.Unlock()
+
+	db.metalock.Lock()
+	defer db.metalock.Unlock()
+
+	db.mmaplock.RLock()
+	defer db.mmaplock.RUnlock()
+
+	return db.close()
 }
 
 func (db *DB) close() error {
@@ -270,9 +301,9 @@ func (db *DB) close() error {
 	db.ops.writeAt = nil
 
 	// Close the mmap.
-	//if err := db.munmap(); err != nil {
-	//	return err
-	//}
+	if err := db.munmap(); err != nil {
+		return err
+	}
 
 	// Close file handles.
 	if db.file != nil {
@@ -283,14 +314,12 @@ func (db *DB) close() error {
 				log.Printf("bolt.Close(): funlock error: %s", err)
 			}
 		}
-
 		// Close the file descriptor.
 		if err := db.file.Close(); err != nil {
 			return errors.Wrap(err, "db file closed")
 		}
 		db.file = nil
 	}
-
 	db.path = ""
 	return nil
 }
@@ -308,7 +337,7 @@ func (db *DB) init() error {
 	{
 		head := db.headPageInBuffer(buf)
 		head.magic = Magic
-		head.Compression = CompSnappy
+		head.Compression = db.compression
 		head.Version = Version
 		offset := PageSz(unsafe.Sizeof(*head))
 		head.indexPtr = RecordPtr{0, offset}
@@ -316,7 +345,7 @@ func (db *DB) init() error {
 		head.ptr = offset
 		head.PageCount = 2
 		head.PageSize = PageSz(db.pageSize)
-		db.header = head
+		db.head = head
 	}
 	{
 		page1 := db.pageInBuffer(buf, 1)
@@ -335,12 +364,118 @@ func (db *DB) init() error {
 	return nil
 }
 
+// mmap opens the underlying memory-mapped file and initializes the meta references.
+// minsz is the minimum size that the new mmap can be.
+func (db *DB) mmap(minsz int) error {
+	db.mmaplock.Lock()
+	defer db.mmaplock.Unlock()
+
+	info, err := db.file.Stat()
+	if err != nil {
+		return errors.Wrap(err, "mmap stat error")
+	} else if int(info.Size()) < db.pageSize*2 {
+		return errors.New("file size too small")
+	}
+
+	// Ensure the size is at least the minimum size.
+	var size = int(info.Size())
+	db.filesz = size
+	if size < minsz {
+		size = minsz
+	}
+	size, err = db.mmapSize(size)
+	if err != nil {
+		return err
+	}
+
+	// Unmap existing data before continuing.
+	if err := db.munmap(); err != nil {
+		return err
+	}
+
+	// Memory-map the data file as a byte slice.
+	if err := mmap(db, size); err != nil {
+		return err
+	}
+
+	// Save references to the meta pages.
+	db.head = db.headPage()
+
+	// Validate the meta pages. We only return an error if both meta pages fail
+	// validation, since meta0 failing validation means that it wasn't saved
+	// properly -- but we can recover using meta1. And vice-versa.
+	err = db.head.validate(db)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// munmap unmaps the data file from memory.
+func (db *DB) munmap() error {
+	if err := munmap(db); err != nil {
+		return errors.Wrap(err, "unmap error")
+	}
+	return nil
+}
+
+// mmapSize determines the appropriate size for the mmap given the current size
+// of the database. The minimum size is 32KB and doubles until it reaches 1GB.
+// Returns an error if the new mmap size is greater than the max allowed.
+func (db *DB) mmapSize(size int) (int, error) {
+	// Double the size from 32KB until 1GB.
+	for i := uint(15); i <= 30; i++ {
+		if size <= 1<<i {
+			return 1 << i, nil
+		}
+	}
+
+	// Verify the requested size is not above the maximum allowed.
+	if size > maxMapSize {
+		return 0, errors.New("mmap too large")
+	}
+
+	// If larger than 1GB then grow by 1GB at a time.
+	sz := int64(size)
+	if remainder := sz % int64(maxMmapStep); remainder > 0 {
+		sz += int64(maxMmapStep) - remainder
+	}
+
+	// Ensure that the mmap size is a multiple of the page size.
+	// This should always be true since we're incrementing in MBs.
+	pageSize := int64(db.pageSize)
+	if (sz % pageSize) != 0 {
+		sz = ((sz / pageSize) + 1) * pageSize
+	}
+
+	// If we've exceeded the max size then only grow up to the max size.
+	if sz > maxMapSize {
+		sz = maxMapSize
+	}
+
+	return int(sz), nil
+}
+
+// page retrieves a page reference from the mmap based on the current page size.
+func (db *DB) headPage() *HeadPage {
+	return (*HeadPage)(unsafe.Pointer(&db.data[0]))
+}
+
+// page retrieves a page reference from the mmap based on the current page size.
+func (db *DB) page(id PageId) *Page {
+	if id == 0 {
+		panic("reading HeadPage page 0 as Page ")
+	}
+	pos := id * PageId(db.pageSize)
+	return (*Page)(unsafe.Pointer(&db.data[pos]))
+}
+
 // headPageInBuffer retrieves a page reference from a given byte array based on the current page size.
 func (*DB) headPageInBuffer(b []byte) *HeadPage {
 	return (*HeadPage)(unsafe.Pointer(&b[0]))
 }
 
 // pageInBuffer retrieves a page reference from a given byte array based on the current page size.
-func (db *DB) pageInBuffer(b []byte, id PagePtr) *Page {
-	return (*Page)(unsafe.Pointer(&b[id*PagePtr(db.pageSize)]))
+func (db *DB) pageInBuffer(b []byte, id PageId) *Page {
+	return (*Page)(unsafe.Pointer(&b[id*PageId(db.pageSize)]))
 }

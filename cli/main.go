@@ -9,7 +9,7 @@ import (
 func main() {
 	//h := sidb.HeadPage{
 	//	Version:     0,
-	//	Compression: sidb.CompSnappy,
+	//	compression: sidb.CompSnappy,
 	//	PageSize:    sidb.PageSz(sidb.DefaultPageSize),
 	//	PageCount:   200,
 	//	Checksum:    crc32.ChecksumIEEE([]byte("dasdasdsd")),
