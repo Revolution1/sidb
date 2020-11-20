@@ -6,3 +6,4 @@ TODO:
 - [ ] put kv
 - [ ] get kv
 - [ ] compact& truncate
+- [ ] docs
