@@ -16,8 +16,8 @@ func main() {
 	//}
 	//se := (*[unsafe.Sizeof(h)]byte)(unsafe.Pointer(&h))
 	//fmt.Println(unsafe.Sizeof(h), se)
-	//b, _ := bolt.Open("", 0600, &bolt.Options{})
-	//b.Update(func(tx *bolt.Tx) error {
+	//b, _ := sidb.Open("", 0600, &sidb.Options{})
+	//b.Update(func(tx *sidb.Tx) error {
 	//	tx.Bucket([]byte("a")).Put([]byte("k"), []byte("v"))
 	//	return nil
 	//})

@@ -1,6 +1,7 @@
 package sidb
 
 import (
+	"fmt"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"hash/crc32"
@@ -21,8 +22,9 @@ const (
 	maxMmapStep = 1 << 30 // 1GB
 
 	// maxAllocSize is the size used when creating array pointers.
-	maxAllocSize     = 0x7FFFFFFF
-	DefaultAllocSize = 16 * 1024 * 1024
+	maxAllocSize = 0x7FFFFFFF
+	// alloc 8 * pagesize on every grow
+	AllocPages = 8
 )
 
 // Options represents the options that can be set when opening a database.
@@ -69,6 +71,14 @@ type RecordPtr struct {
 	offset  PageSz // 4
 }
 
+// size: 16
+// index for page
+type Index struct {
+	Start   [6]byte
+	End     [6]byte
+	PageNum uint32
+}
+
 // size: 48, aligned: 48
 type HeadPage struct {
 	magic uint32 // 4
@@ -79,7 +89,9 @@ type HeadPage struct {
 	Compression CompressAlgorithm // 2
 	PageSize    PageSz            // 4
 
-	PageCount      PageId // 4
+	// count of all allocated pages including head page
+	PageCount PageId // 4
+	// count of all index page
 	IndexPageCount uint32 // 4
 
 	// point to the last record
@@ -106,14 +118,6 @@ func (h *HeadPage) validate(db *DB) error {
 	return nil
 }
 
-// size: 16
-// index for page
-type Index struct {
-	Start   [6]byte
-	End     [6]byte
-	PageNum uint32
-}
-
 type DB struct {
 	// When enabled, the database will perform a Check() after every commit.
 	// A panic is issued if the database is in an inconsistent state. This
@@ -138,32 +142,27 @@ type DB struct {
 	// Skipping truncation avoids preallocation of hard drive space and
 	// bypasses a truncate() and fsync() syscall on remapping.
 	//
-	// https://github.com/boltdb/bolt/issues/284
+	// https://github.com/sidbdb/sidb/issues/284
 	NoGrowSync bool
 
 	// If you want to read the entire database fast, you can set MmapFlag to
 	// syscall.MAP_POPULATE on Linux 2.6.23+ for sequential read-ahead.
 	MmapFlags int
 
-	// AllocSize is the amount of space allocated when the database
-	// needs to create new pages. This is done to amortize the cost
-	// of truncate() and fsync() when growing the data file.
-	AllocSize int
-
 	path string
 	file *os.File
 	//lockfile *os.File // windows only
-	dataref  []byte // mmap'ed readonly, write throws SEGV
-	data     *[maxMapSize]byte
-	datasz   int
-	filesz   int // current on disk file size
-	pageSize int
-	opened   bool
+	dataref   []byte // mmap'ed readonly, write throws SEGV
+	data      *[maxMapSize]byte
+	datasz    int
+	filesz    int // current on disk file size
+	pageSize  int
+	allocSize int
+	opened    bool
 
 	rwlock   sync.Mutex   // Allows only one writer at a time.
-	metalock sync.Mutex   // Protects meta page access.
+	headlock sync.Mutex   // Protects head page access.
 	mmaplock sync.RWMutex // Protects mmap access during remapping.
-	statlock sync.RWMutex // Protects stats access.
 	pagePool sync.Pool
 
 	ops struct {
@@ -191,9 +190,6 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	}
 	db.NoGrowSync = options.NoGrowSync
 	db.MmapFlags = options.MmapFlags
-
-	// Set default values for later DB operations.
-	db.AllocSize = DefaultAllocSize
 
 	db.compression = options.Compression
 
@@ -248,6 +244,7 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 			db.pageSize = int(h.PageSize)
 		}
 	}
+	db.allocSize = AllocPages * db.pageSize
 
 	// Initialize page pool.
 	db.pagePool = sync.Pool{
@@ -281,8 +278,8 @@ func (db *DB) Close() error {
 	db.rwlock.Lock()
 	defer db.rwlock.Unlock()
 
-	db.metalock.Lock()
-	defer db.metalock.Unlock()
+	db.headlock.Lock()
+	defer db.headlock.Unlock()
 
 	db.mmaplock.RLock()
 	defer db.mmaplock.RUnlock()
@@ -311,7 +308,7 @@ func (db *DB) close() error {
 		if !db.readOnly {
 			// Unlock the file.
 			if err := funlock(db); err != nil {
-				log.Printf("bolt.Close(): funlock error: %s", err)
+				log.Printf("sidb.Close(): funlock error: %s", err)
 			}
 		}
 		// Close the file descriptor.
@@ -344,6 +341,7 @@ func (db *DB) init() error {
 		head.kvPtr = RecordPtr{1, PageSz(unsafe.Sizeof(Page{}))}
 		head.ptr = offset
 		head.PageCount = 2
+		head.IndexPageCount = 0
 		head.PageSize = PageSz(db.pageSize)
 		db.head = head
 	}
@@ -361,6 +359,42 @@ func (db *DB) init() error {
 		return err
 	}
 
+	return nil
+}
+
+func (db *DB) gerFreePage() PageId {
+	return 0
+}
+
+// grow grows the size of the database to the given sz.
+func (db *DB) grow(sz int) error {
+	// Ignore if the new size is less than available file size.
+	if sz <= db.filesz {
+		return nil
+	}
+
+	// If the data is smaller than the alloc size then only allocate what's needed.
+	// Once it goes over the allocation size then allocate in chunks.
+	if db.datasz < db.allocSize {
+		sz = db.datasz
+	} else {
+		sz += db.allocSize
+	}
+
+	// Truncate and fsync to ensure file size metadata is flushed.
+	// https://github.com/sidbdb/sidb/issues/284
+	if !db.NoGrowSync && !db.readOnly {
+		if runtime.GOOS != "windows" {
+			if err := db.file.Truncate(int64(sz)); err != nil {
+				return errors.Wrap(err, "file resize error")
+			}
+		}
+		if err := db.file.Sync(); err != nil {
+			return errors.Wrap(err, "file sync error")
+		}
+	}
+
+	db.filesz = sz
 	return nil
 }
 
@@ -478,4 +512,14 @@ func (*DB) headPageInBuffer(b []byte) *HeadPage {
 // pageInBuffer retrieves a page reference from a given byte array based on the current page size.
 func (db *DB) pageInBuffer(b []byte, id PageId) *Page {
 	return (*Page)(unsafe.Pointer(&b[id*PageId(db.pageSize)]))
+}
+
+// GoString returns the Go string representation of the database.
+func (db *DB) GoString() string {
+	return fmt.Sprintf("sidb.DB{path:%q}", db.path)
+}
+
+// String returns the string representation of the database.
+func (db *DB) String() string {
+	return fmt.Sprintf("DB<%q>", db.path)
 }
